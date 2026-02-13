@@ -1,0 +1,48 @@
+[project]
+name = "nano-language-model"
+version = "0.1.0"
+description = "Nano model that transforms natural language into propositional logic"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # — Core ML —
+    "torch>=2.2.0",
+    "lightning>=2.4.0",
+    "torchmetrics>=1.6.0",
+    # — Tokenization —
+    "tokenizers>=0.21.0",
+    # — Data —
+    "jsonlines>=4.0.0",
+    "rich>=13.9.0",
+    # — Logging —
+    "tensorboard>=2.18.0",
+    # — Data Generation —
+    "openai>=2.20.0",
+    "python-dotenv>=1.2.1",
+    # — Evaluation —
+    "sympy>=1.14.0",
+    # — Demo (future) —
+    "gradio>=5.0.0",
+    "pyrefly>=0.48.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.14.13",
+    "pytest>=8.0.0",
+    "pytest-cov>=6.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
