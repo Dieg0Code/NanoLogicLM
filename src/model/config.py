@@ -139,6 +139,12 @@ class NanoLogicConfig:
     # =================================================================
     # Cada uno de estos cuesta casi 0 en computación pero mejora el modelo.
 
+    # rope_theta: base para la frecuencia de Rotary Embeddings.
+    # Controla cómo rota el espacio vectorial para codificar posiciones.
+    # 10000.0 es el estándar (RoFormer, GPT-NeoX, PaLM).
+    # Para contextos muy largos (>32k), se usa 500000.0 (CodeLlama).
+    rope_theta: float = 10000.0
+
     # weight_tying: compartir pesos entre la embedding layer y el linear head.
     # La embedding convierte IDs → vectores.
     # El head convierte vectores → probabilidades sobre IDs.

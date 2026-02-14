@@ -924,6 +924,506 @@ la inicializacion por el ancho, que ya hacemos con Deep Norm beta.
 
 ---
 
+#### ✅ Dataset Pipeline — como alimentar al modelo eficientemente
+
+El dataset (`src/training/dataset.py`) es el "cocinero" que transforma archivos JSONL
+en tensores listos para el modelo. Implementa 5 tricks de eficiencia integrados.
+
+**El problema**: los datos están en texto. El modelo solo entiende tensores (matrices de números).
+
+```
+Archivo JSONL:
+  {"sequence": "<|bos|><|input|> Si llueve me mojo <|output|>... <|formula|> p → q <|eos|>"}
+  ...6080 ejemplos más
+
+         ↓  dataset.py  ↓
+
+Tensores para el modelo:
+  input_ids:      [[1, 4, 563, 892, ...],    # (batch=8, seq_len=128)
+                   [1, 4, 238, 447, ...], ...]
+  targets:        [[4, 563, 892, ..., 2],     # shifted right (predecir SIGUIENTE)
+                   [4, 238, 447, ..., 2], ...]
+  attention_mask: [[1,1,1,...,0,0,0],         # 1=token real, 0=padding
+                   [1,1,1,...,0,0,0], ...]
+```
+
+3 piezas principales:
+
+```
+1. Dataset   → "Acá están los datos" (acceso por índice)
+2. Collator  → "Así los empaqueto" (padding, masks, batching)
+3. DataLoader → "Así los sirvo" (shuffling, workers, prefetch)
+```
+
+##### Trick 1: Pre-tokenización offline
+
+Tokenizar en cada epoch es repetir trabajo.
+
+```
+Sin pre-tokenización:
+  Epoch 1: tokenizar 6080 ejemplos (3 seg) → entrenar
+  Epoch 2: tokenizar 6080 ejemplos (3 seg) → entrenar  ← repetido!
+  Epoch 3: tokenizar 6080 ejemplos (3 seg) → entrenar  ← repetido!
+
+Con pre-tokenización:
+  Setup:   tokenizar 6080 ejemplos (3 seg) → guardar en memoria
+  Epoch 1: entrenar (0 seg tokenización)
+  Epoch 2: entrenar (0 seg tokenización)
+  Epoch 3: entrenar (0 seg tokenización)
+```
+
+Con 6K datos caben en RAM sin problema. Tokenizar una vez y cachear.
+
+##### Trick 2: Dynamic Padding
+
+El approach ingenuo rellena TODO a `max_seq_len=1024`:
+
+```
+Naive Padding:
+  "Si llueve me mojo"      → [tok, tok, tok, tok, PAD, PAD, ..., PAD]  (1024)
+  "Si A entonces B y C"    → [tok, tok, tok, tok, tok, tok, PAD, ..., PAD]  (1024)
+                                                            ↑
+                                           1018 PADs inútiles por secuencia!
+```
+
+Dynamic Padding rellena al **máximo del batch**, no al máximo global:
+
+```
+Dynamic Padding (batch de 4 secuencias cortas):
+  "Si llueve me mojo"       → [tok, tok, tok, tok, PAD, PAD]  (6)
+  "Si A entonces B y C"     → [tok, tok, tok, tok, tok, tok]  (6)
+  "Llueve y truena"         → [tok, tok, tok, PAD, PAD, PAD]  (6)
+  "A implica B"             → [tok, tok, tok, PAD, PAD, PAD]  (6)
+
+  Total: 4 × 6 = 24 tokens procesados
+  Naive: 4 × 1024 = 4096 tokens procesados
+  Speedup: 170x menos cómputo para este batch!
+```
+
+Nuestras secuencias van de ~20 a ~300 tokens. Rellenar a 1024 sería desperdiciar 95%+ del cómputo.
+
+##### Trick 3: Length Bucketing
+
+Agrupar secuencias de largo similar en el mismo batch, minimizando el padding incluso con Dynamic Padding:
+
+```
+Sin bucketing (batch aleatorio):
+  Secuencia 1:  30 tokens
+  Secuencia 2: 250 tokens  ← fuerza padding a 250 para TODOS
+  Secuencia 3:  15 tokens
+  Secuencia 4:  22 tokens
+  → Padded a 250. Desperdicio: 683 PADs
+
+Con bucketing:
+  Batch A: [15, 22, 28, 30]    → padded a 30.  Desperdicio: 45 PADs
+  Batch B: [240, 245, 248, 250] → padded a 250. Desperdicio: 17 PADs
+  → Total desperdicio: 62 PADs (vs 683!)
+```
+
+Algoritmo (`BucketBatchSampler`):
+1. Ordenar índices por largo de secuencia
+2. Crear mega-buckets de `batch_size × 10` ejemplos
+3. Shufflear dentro de cada mega-bucket
+4. Particionar en batches de `batch_size`
+5. Shufflear el orden de los batches (sin sesgo sistemático)
+
+##### Trick 4: Packing + Document Mask (Underground)
+
+La técnica más underground y efectiva. En vez de 1 ejemplo por secuencia,
+empaquetar múltiples ejemplos hasta llenar `max_seq_len`:
+
+```
+Sin packing (padding):
+  Seq 1: [BOS, ejemplo_1, EOS, PAD, PAD, PAD, PAD]     128 tokens (50 reales)
+  Seq 2: [BOS, ejemplo_2, EOS, PAD, PAD, PAD, PAD]     128 tokens (35 reales)
+  Seq 3: [BOS, ejemplo_3, EOS, PAD, PAD, PAD, PAD]     128 tokens (40 reales)
+  → 384 tokens procesados, 125 reales (32% eficiencia)
+
+Con packing:
+  Seq 1: [BOS, ej_1, EOS, BOS, ej_2, EOS, BOS, ej_3, EOS, PAD]  128 tokens (125 reales)
+  → 128 tokens procesados, 125 reales (98% eficiencia!)
+```
+
+**El problema**: con la causal mask normal, el ejemplo 2 puede VER al ejemplo 1.
+Pero son oraciones completamente distintas — mezclarlas genera correlaciones espurias.
+
+**La solución**: Document Mask — mask block-diagonal causal. Cada documento solo
+puede atender a tokens de SU MISMO documento:
+
+```
+                  ej_1      ej_2      ej_3
+ej_1:       [ ✅ ✅ ✅ | ❌ ❌ ❌ | ❌ ❌ ❌ ]
+ej_2:       [ ❌ ❌ ❌ | ✅ ✅ ✅ | ❌ ❌ ❌ ]  ← solo ve SU documento
+ej_3:       [ ❌ ❌ ❌ | ❌ ❌ ❌ | ✅ ✅ ✅ ]  ← solo ve SU documento
+```
+
+Implementación: `build_document_mask()` construye esta mask a partir de
+un vector `doc_ids` que indica a qué documento pertenece cada token.
+
+##### Trick 5: Curriculum Learning
+
+Entrenar primero con ejemplos fáciles y luego agregar los difíciles.
+El modelo construye entendimiento de abajo hacia arriba (como aprender a caminar antes de correr):
+
+```
+Epochs  0-4:  Solo "Simple"       → p → q, p ∧ q
+Epochs  5-14: + "Intermediate"    → p ∧ q → r
+Epochs 15-30: + "Advanced"        → (p ∧ q) → (r ∨ ¬s)
+```
+
+Nuestro dataset ya tiene la columna `complexity` → solo es cuestión de filtrar por epoch.
+
+Componentes principales en `dataset.py`:
+
+| Componente | Función |
+|------------|---------|
+| `NanoLogicDataset` | Carga + pre-tokeniza + filtra por complejidad |
+| `NanoLogicCollator` | Dynamic Padding ó Packing + Document Mask |
+| `BucketBatchSampler` | Agrupa por largo similar |
+| `pack_examples()` | Empaqueta múltiples docs en una secuencia |
+| `build_document_mask()` | Mask block-diagonal causal |
+| `create_dataloader()` | Fábrica que ensambla todo el pipeline |
+
+---
+
+#### ✅ LightningModule — el director del entrenamiento
+
+El LightningModule (`src/training/lit_module.py`) es el "director de orquesta"
+que coordina todo el entrenamiento. Con Lightning, defines QUÉ hacer y él se
+encarga del CÓMO (GPU, mixed precision, checkpoints, logging, etc.).
+
+```
+Sin Lightning (manual ~200 líneas):       Con Lightning (lit_module.py):
+┌────────────────────────────────┐       ┌────────────────────────────────┐
+│ for epoch in range(100):        │       │ class LitNanoLogic:             │
+│   for batch in loader:          │       │                                 │
+│     optimizer.zero_grad()       │       │   training_step(batch):         │
+│     outputs = model(batch)      │       │     return loss                 │
+│     loss.backward()             │       │                                 │
+│     clip_gradients(model)       │       │   configure_optimizers():       │
+│     optimizer.step()            │       │     return AdamW(...)           │
+│     scheduler.step()            │       └────────────────────────────────┘
+│     if step % 100: log(...)     │       Lightning se encarga de:
+│     if step % 1000: save(...)   │       ✅ GPU/multi-GPU    ✅ Logging
+│     # manejar GPU/fp16/crash... │       ✅ Mixed precision  ✅ Checkpoints
+└────────────────────────────────┘       ✅ Gradient clipping ✅ Resume
+```
+
+4 piezas del LitModule:
+
+```
+1. training_step()         → "Así entreno un batch"
+2. validation_step()       → "Así evalúo un batch"
+3. configure_optimizers()  → "Qué optimizer y scheduler usar"
+4. train_dataloader()      → "De dónde vienen los datos"
+```
+
+##### Trick 1: Schedule-Free AdamW (Facebook Research, 2024)
+
+El descubrimiento más importante de optimización reciente. Elimina el scheduler.
+
+```
+Approach clásico:
+  lr = warmup → cosine decay → 0
+  Problemas:
+    - Elegir steps de warmup, cuándo decae, etc.
+    - Si entrenas más de lo planeado, el lr ya está en 0
+    - 3+ hiperparámetros extra que tunear
+
+Schedule-Free:
+  lr = constante TODO el entrenamiento
+  El optimizer interpola internamente entre dos sequences de pesos
+  → Converge igual o MEJOR que cosine decay
+  → Zero hiperparámetros de scheduling
+```
+
+Incluye fallback a AdamW + Cosine Decay si `schedulefree` no está instalado.
+
+##### Trick 2: Gradient Noise Injection (Underground, Google)
+
+Agrega ruido gaussiano decreciente a los gradientes:
+
+```python
+noise = sqrt(eta / (1 + t)^gamma) * N(0, 1)
+grad = grad + noise
+```
+
+El ruido ayuda a escapar mínimos locales malos. Es como sacudir una pelota
+en un valle para que caiga a un valle más profundo. Con pocos datos (6K),
+el landscape del loss es más irregular → más mínimos locales → más beneficio.
+
+El ruido decae con el tiempo: al inicio explora mucho, al final se estabiliza
+(como simulated annealing). Implementado en el hook `on_after_backward()`.
+
+##### Trick 3: EMA de pesos (Exponential Moving Average)
+
+Mantiene una copia "suavizada" de los pesos del modelo:
+
+```
+ema_weight = 0.999 × ema_weight + 0.001 × current_weight
+```
+
+Los pesos actuales oscilan durante entrenamiento. El EMA elimina las oscilaciones:
+
+```
+Paso 100: weight = 0.5    ema = 0.50
+Paso 200: weight = 0.8    ema = 0.65
+Paso 300: weight = 0.3    ema = 0.55  ← más estable que 0.3
+Paso 400: weight = 0.7    ema = 0.60
+```
+
+En validación e inferencia se usan los pesos EMA → predicciones más consistentes.
+Implementado con `swap_to_ema()` / `swap_from_ema()`.
+
+##### Trick 4: Label Smoothing
+
+En vez de target 100% seguro ("mojo" = probabilidad 1.0), suavizar para evitar
+overconfidence:
+
+```
+Sin smoothing:  target = [0, 0, 0, 1.0, 0, 0, 0]    → overconfident
+Con smoothing:  target = [0.02, 0.02, 0.02, 0.88, 0.02, 0.02, 0.02]  → humilde
+```
+
+Usando `cross_entropy(label_smoothing=0.1)` de PyTorch.
+
+##### Trick 5: Gradient Clipping por norma global
+
+Si los gradientes se hacen muy grandes, el entrenamiento diverge:
+
+```
+Sin clipping:  grad = [1000, -2000, 500]  → paso gigante → loss = NaN
+Con clipping:  grad = [0.5, -1.0, 0.25]   → paso controlado → estable
+```
+
+La norma global (vs per-parameter) mantiene la DIRECCIÓN del gradiente intacta,
+solo escala la magnitud. `max_norm=1.0` es el estándar.
+
+##### Trick 6: Mixed Precision (bf16)
+
+Entrenar con números de 16 bits en vez de 32:
+
+```
+fp32: 32 bits → más preciso, 2x más lento, 2x más memoria
+bf16: 16 bits → menos preciso, 2x más rápido, 2x menos memoria
+```
+
+bf16 es mejor que fp16 porque tiene el mismo rango que fp32 (solo pierde
+precisión). No necesita loss scaling. Se configura en el Trainer de Lightning
+con `precision="bf16-mixed"`.
+
+##### Trick 7: Gradient Accumulation
+
+Simular batch sizes grandes sin explotar la memoria:
+
+```
+GPU tiene 8GB → caben 4 ejemplos por batch
+Queremos batch efectivo de 32
+
+Sin accumulation:  batch=4, actualizar cada 4 ejemplos     (ruidoso)
+Con accumulation:  batch=4 × 8 micro-steps = 32 efectivo   (estable)
+```
+
+Acumular gradientes de N micro-batches antes de `optimizer.step()`.
+Se configura en Lightning con una línea: `accumulate_grad_batches=8`.
+
+**Weight Decay selectivo**: no se aplica a biases, norms, ni embeddings.
+Solo a pesos de capas lineales. Esto es estándar en todos los LLMs modernos.
+
+**TrainingConfig**: todos los hiperparámetros con defaults razonables:
+
+| Parámetro | Default | Función |
+|-----------|---------|---------|
+| `lr` | 1e-3 | Learning rate |
+| `weight_decay` | 0.1 | Regularización L2 selectiva |
+| `batch_size` | 8 | Ejemplos por micro-batch |
+| `accumulate_grad_batches` | 4 | Batch efectivo = 32 |
+| `label_smoothing` | 0.1 | Anti-overconfidence |
+| `gradient_clip_norm` | 1.0 | Max norma de gradientes |
+| `gradient_noise_eta` | 0.1 | Escala inicial del ruido |
+| `ema_decay` | 0.999 | Factor de suavizado EMA |
+| `curriculum_schedule` | {0:0, 5:1, 15:2} | Simple → Inter → Advanced |
+
+---
+
+#### ✅ Train Entry Point — el botón START
+
+El entry point (`train.py`) es el archivo que ejecutas para arrancar el entrenamiento.
+Ensambla todas las piezas: tokenizer, modelo, datos, callbacks, y Trainer.
+
+```bash
+python train.py                                    # defaults (todos los tricks ON)
+python train.py --lr 5e-4 --batch-size 16          # override hiperparámetros
+python train.py --debug --fast-dev-run              # test rápido con anomaly detection
+python train.py --compile                           # 1.5-2x speedup con torch.compile
+python train.py --resume models/checkpoints/last.ckpt  # resumir entrenamiento
+```
+
+##### Trick 1: Smart Checkpointing
+
+No guardar TODOS los checkpoints (llenan disco). Solo guardar:
+- Los **top-K** modelos por `val/loss` (K=3)
+- El **último** checkpoint (para resumir si crashea)
+
+```
+Naive:  epoch_1.ckpt, epoch_2.ckpt, ..., epoch_30.ckpt  → 30 × 80MB = 2.4GB
+Smart:  best_1.ckpt, best_2.ckpt, best_3.ckpt, last.ckpt → 4 × 80MB = 320MB
+```
+
+##### Trick 2: Auto-detect Precision
+
+Detecta automáticamente qué precisión soporta la GPU:
+
+```
+GPU A100/H100 (Ampere+):  bf16-mixed  (mejor opción)
+GPU T4/V100 (Turing):     16-mixed    (fp16 con loss scaling)
+GPU antigua / CPU:         32          (sin aceleración)
+```
+
+No hardcodear — funciona en Colab (T4) y en GPUs mejores sin cambiar código.
+
+##### Trick 3: Seed Everything
+
+Fijar TODAS las semillas aleatorias: PyTorch, NumPy, Python, CUDA.
+Si corres el mismo script dos veces, obtienes el mismo resultado exacto.
+Crucial para debugging y reproducibilidad.
+
+##### Trick 4: Anomaly Detection (modo debug)
+
+PyTorch detecta operaciones que producen NaN o Inf y dice EXACTAMENTE qué
+operación lo causó. Es lento (solo para debug con `--debug`), pero te salva
+horas de búsqueda cuando algo falla.
+
+##### Trick 5: torch.compile (Underground, PyTorch 2.0+)
+
+Compila el modelo a un grafo optimizado: fusiona operaciones, elimina
+redundancias, usa kernels CUDA optimizados.
+
+```
+Sin compile:  matmul → ReLU → matmul → softmax → matmul  (5 kernel launches)
+Con compile:  [matmul+ReLU+matmul] → [softmax+matmul]     (2 kernel launches)
+Speedup: 1.5-2x gratis
+```
+
+El primer paso es lento (compilación). Después vuela. Se activa con `--compile`.
+
+##### Trick 6: Gradient Checkpointing
+
+Recalcular activaciones en backward en vez de guardarlas en memoria.
+-50% memoria, +20% tiempo. Solo si hay OOM. Se activa con `--grad-ckpt`.
+
+##### Trick 7: CLI con argumentos
+
+Override de cualquier hiperparámetro sin tocar el código:
+
+```bash
+python train.py --lr 5e-4 --max-epochs 50 --batch-size 16
+python train.py --no-schedule-free --no-ema    # desactivar tricks
+python train.py --curriculum "0:0,10:1,20:2"   # curriculum custom
+```
+
+Resumen de ejecución al iniciar:
+
+```
+🚀 INICIANDO ENTRENAMIENTO
+   Modelo:        21,000,000 params
+   Batch size:    8 × 4 = 32 efectivo
+   LR:            0.001
+   Precision:     bf16-mixed
+   Packing:       ✅
+   Schedule-Free: ✅
+   EMA:           ✅
+   Curriculum:    {0: 0, 5: 1, 15: 2}
+```
+
+---
+
+---
+
+#### ✅ Evaluación — ¿realmente funciona el modelo?
+
+El módulo de evaluación (`src/evaluation/`) mide si el modelo genera fórmulas
+correctas. El `val/loss` dice qué tan bien predice tokens, pero NO dice si la
+fórmula resultante es lógicamente correcta.
+
+3 piezas de evaluación:
+
+```
+1. metrics.py      → "¿Cuántas fórmulas acertó?"
+2. truth_table.py  → "¿Son lógicamente equivalentes?"
+3. benchmark.py    → "¿Cómo le va en cada categoría?"
+```
+
+##### Trick 1: Equivalencia Semántica por Tabla de Verdad
+
+La métrica más importante. Dos fórmulas son equivalentes si tienen la misma
+tabla de verdad, incluso si el texto es diferente:
+
+```
+p ∧ q → r   vs   q ∧ p → r
+
+p | q | r | p∧q→r | q∧p→r
+0 | 0 | 0 |   1   |   1
+...
+1 | 1 | 0 |   0   |   0     ← mismos valores en TODAS las filas
+1 | 1 | 1 |   1   |   1
+
+Resultado: EQUIVALENTES ✅
+```
+
+##### Trick 2: Compositional Metrics (Evaluation Layers)
+
+Desglosa la evaluación en 4 niveles de composición para diagnosticar el error exacto:
+
+```
+Nivel 1 — Átomos:          ¿identificó p, q, r?
+Nivel 2 — Sub-fórmulas:    ¿armó p∧q, ¬s, r∨¬s correctamente?
+Nivel 3 — Conector raíz:   ¿eligió → como conector principal?
+Nivel 4 — Fórmula total:   ¿es equivalente?
+```
+
+##### Trick 3: Analysis Dimensions (Benchmark)
+
+Microscopio completo del rendimiento:
+
+- **Por Complejidad**: Simple 95% → Inter 82% → Advanced 43%
+- **Por Conector**: ∧ 93%, ∨ 85%, → 78%, ↔ 52%
+- **Por Bloque**: Causal 87%, Temporal 79%, Científico 65%
+- **Por Largo**: 1-2 conectores 91% → 5+ conectores 38%
+
+##### Trick 4: Confusion Matrix (Underground)
+
+No solo accuracy, sino ¿CON QUÉ lo confunde?
+
+```
+Real: →
+Pred: ↔  (15 veces)
+
+Diagnóstico: El modelo confunde implicación con bicondicional.
+```
+
+##### Trick 5: Scaling Analysis (Underground)
+
+¿Cómo escala la accuracy con la cantidad de átomos?
+- 2 átomos: 94%
+- 3 átomos: 85%
+- 5 átomos: 42% (techo de composicionalidad)
+
+##### Trick 6: Partial Credit (Tree Edit Distance)
+
+En vez de 0/1, crédito parcial basado en similitud de árboles (AST):
+`p ∧ q → r` vs `p ∧ q → s` = 0.8 (solo 1 nodo diferente).
+
+Componentes por archivo:
+
+| Archivo | Función |
+|---------|---------|
+| `truth_table.py` | Parser, AST, tabla de verdad, equivalencia semántica |
+| `metrics.py` | Exact match, partial credit, compositional score, normalización |
+| `benchmark.py` | Desglose por complejidad/conector/bloque, confusion matrix |
+
+---
+
 #### ✅ Special Tokens — el protocolo de comunicación del modelo
 
 Son tokens inventados que NO existen en el lenguaje natural. Le dan estructura

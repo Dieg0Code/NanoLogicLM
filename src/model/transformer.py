@@ -234,6 +234,7 @@ class NanoLogicTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass completo del modelo.
 
@@ -241,6 +242,10 @@ class NanoLogicTransformer(nn.Module):
             input_ids: Token IDs de forma (batch, seq_len)
             targets: Token IDs objetivo para calcular loss (opcional).
                      Si se proveen, retorna loss ademas de logits.
+            mask: Mascara de atencion (opcional).
+                  - None: genera causal mask estandar (triangular inferior)
+                  - Tensor (batch, seq_len, seq_len): document mask para packing
+                    (block-diagonal causal, impide cross-attention entre docs)
 
         Returns:
             Dict con:
@@ -271,7 +276,7 @@ class NanoLogicTransformer(nn.Module):
         # PASO 2: Pasar por los 8 bloques
         # ============================================================
         for layer in self.layers:
-            x = layer(x, self.rope_freqs)
+            x = layer(x, self.rope_freqs, mask)
 
         # ============================================================
         # PASO 3: Normalizacion final

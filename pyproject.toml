@@ -24,6 +24,7 @@ dependencies = [
     # — Demo (future) —
     "gradio>=5.0.0",
     "pyrefly>=0.48.2",
+    "schedulefree>=1.4.1",
 ]
 
 [project.optional-dependencies]

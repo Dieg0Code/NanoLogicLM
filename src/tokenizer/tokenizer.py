@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders, processors
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors, trainers
 from tokenizers.normalizers import NFC
 
 from src.tokenizer.special_tokens import SPECIAL_TOKENS
@@ -204,25 +204,29 @@ class NanoLogicTokenizer:
         self._tokenizer.save(str(path / "tokenizer.json"))
 
     @classmethod
-    def load(cls, directory: str) -> "NanoLogicTokenizer":
+    def load(cls, path_or_dir: str) -> NanoLogicTokenizer:
         """Carga un tokenizer previamente entrenado desde disco.
 
         Args:
-            directory: Directorio donde está el tokenizer.json.
+            path_or_dir: Ruta al archivo tokenizer.json O al directorio que lo contiene.
 
         Returns:
             Una instancia de NanoLogicTokenizer lista para usar.
-
-        Uso:
-            tokenizer = NanoLogicTokenizer.load("models/tokenizer/")
-            ids = tokenizer.encode("Si llueve me mojo")
         """
         instance = cls.__new__(cls)  # Crear instancia sin llamar a __init__
-        path = Path(directory) / "tokenizer.json"
+
+        path = Path(path_or_dir)
+
+        # Si es un directorio, buscar tokenizer.json dentro
+        if path.is_dir():
+            path = path / "tokenizer.json"
+
         if not path.exists():
-            raise FileNotFoundError(
-                f"No se encontró tokenizer.json en {directory}. ¿Ya entrenaste el tokenizer?"
-            )
+            msg = f"No se encontró el tokenizer en: {path}."
+            if path.name == "tokenizer.json":
+                msg += " ¿Ya entrenaste el tokenizer?"
+            raise FileNotFoundError(msg)
+
         instance._tokenizer = Tokenizer.from_file(str(path))
         instance._trained = True
         return instance
