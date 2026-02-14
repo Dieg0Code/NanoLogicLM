@@ -448,7 +448,7 @@ class NanoLogicCollator:
         return {
             "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
             "targets": torch.tensor(all_targets, dtype=torch.long),
-            "document_mask": torch.stack(all_doc_masks),
+            "document_mask": torch.stack(all_doc_masks).unsqueeze(1),
         }
 
 

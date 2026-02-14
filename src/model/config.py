@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class NanoLogicConfig:
     """Configuración completa del modelo NanoLogic.
 

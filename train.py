@@ -133,8 +133,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Entrenamiento ---
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size por micro-step")
+    parser.add_argument(
+        "--lr", type=float, default=3e-4, help="Learning Rate inicial (default: 3e-4)"
+    )
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size por GPU (default: 8)")
     parser.add_argument(
         "--accumulate",
         type=int,
@@ -177,6 +179,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Hardware ---
+    parser.add_argument(
+        "--accelerator", type=str, default="auto", help="Tipo de acelerador (gpu, cpu, tpu, auto)"
+    )
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="auto",
+        help="Cantidad de dispositivos o lista (ej: 1, 'auto')",
+    )
     parser.add_argument(
         "--precision", type=str, default="auto", help="Precision: auto, bf16-mixed, 16-mixed, 32"
     )
@@ -271,6 +282,7 @@ def main() -> None:
 
     curriculum_schedule = parse_curriculum(args.curriculum)
 
+    # Configurar entrenamiento
     train_config = TrainingConfig(
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -389,8 +401,8 @@ def main() -> None:
         # --- Epochs ---
         max_epochs=args.max_epochs,
         # --- Hardware ---
-        accelerator="auto",  # auto-detect: GPU, CPU, TPU
-        devices="auto",  # auto-detect: cuantas GPUs
+        accelerator=args.accelerator,  # auto-detect: GPU, CPU, TPU
+        devices=args.devices,  # auto-detect: cuantas GPUs
         precision=precision,
         # --- Gradient ---
         accumulate_grad_batches=args.accumulate,

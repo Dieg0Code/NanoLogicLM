@@ -425,15 +425,17 @@ class CausalAttention(nn.Module):
             scores1 = cap * torch.tanh(scores1 / cap)
             scores2 = cap * torch.tanh(scores2 / cap)
 
-        # Causal mask
         if mask is None:
             mask = self._make_causal_mask(q1.shape[2], q1.device, q1.dtype)
-        scores1 = scores1 + mask
-        scores2 = scores2 + mask
 
-        # Softmax por separado (en float32 para estabilidad)
-        attn1 = F.softmax(scores1, dim=-1, dtype=torch.float32).type_as(q1)
-        attn2 = F.softmax(scores2, dim=-1, dtype=torch.float32).type_as(q2)
+        # Estabilidad numerica: operar masking y softmax en float32
+        # Evita NaN si scores > 65504 (overflow en fp16) y se suma -inf de la mascara
+        scores1 = scores1.to(torch.float32) + mask
+        scores2 = scores2.to(torch.float32) + mask
+
+        # Softmax (ya en float32)
+        attn1 = F.softmax(scores1, dim=-1).type_as(q1)
+        attn2 = F.softmax(scores2, dim=-1).type_as(q2)
 
         # Differential: restar patron 2 de patron 1
         # lambda es aprendible — el modelo decide cuanto ruido cancelar
